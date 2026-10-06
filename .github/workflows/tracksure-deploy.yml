@@ -1,0 +1,89 @@
+name: TrackSure deploy with outcome telemetry (Lab 18)
+
+on:
+  workflow_dispatch:
+    inputs:
+      web_app_name:
+        description: Target web app (override only for the deliberate failed-deployment test)
+        required: true
+        default: app-tracksure-ch18-rtg
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-tracksure-lab-ch18
+  LOGS_INGESTION_ENDPOINT: https://dcr-deployment-telemetry-53ty-eastus.logs.z1.ingest.monitor.azure.com
+  DCR_IMMUTABLE_ID: dcr-2b81535d6f604706b0346ed5af2ddeb8
+  DEPLOYMENT_STREAM: Custom-DeploymentTelemetry_CL
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: tracksure-staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Publish and package TrackSure
+        run: |
+          set -euo pipefail
+          dotnet publish RallTheoryGroup/src/products/tracksure/src/TrackSure.csproj -c Release -o "$RUNNER_TEMP/publish"
+          cd "$RUNNER_TEMP/publish" && zip -qr "$RUNNER_TEMP/tracksure.zip" .
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Deploy TrackSure to App Service
+        env:
+          WEB_APP: ${{ inputs.web_app_name }}
+        run: |
+          set -euo pipefail
+          az webapp deploy --name "$WEB_APP" --resource-group "$RESOURCE_GROUP" \
+            --src-path "$RUNNER_TEMP/tracksure.zip" --type zip --output none
+          curl --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 10 --max-time 20 \
+            "https://$WEB_APP.azurewebsites.net/health"
+
+  record-outcome:
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-latest
+    environment: tracksure-staging
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Record deployment outcome
+        shell: pwsh
+        env:
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $status = switch ($env:DEPLOY_RESULT) {
+            'success'   { 'Succeeded' }
+            'failure'   { 'Failed' }
+            'cancelled' { 'Canceled' }
+            'skipped'   { 'Skipped' }
+            default     { throw "Unmapped deploy result '$($env:DEPLOY_RESULT)'." }
+          }
+          $token = az account get-access-token --resource https://monitor.azure.com/ --query accessToken -o tsv
+          if ($LASTEXITCODE -ne 0 -or -not $token) { throw 'Cannot obtain ingestion token.' }
+          $record = @{
+            TimeGenerated = [DateTime]::UtcNow.ToString('o')
+            Application = 'TrackSure'
+            Environment = 'staging'
+            RunId = $env:GITHUB_RUN_ID
+            CommitId = $env:GITHUB_SHA
+            Status = $status
+          }
+          $body = ConvertTo-Json -InputObject @($record) -Compress
+          $uri = $env:LOGS_INGESTION_ENDPOINT.TrimEnd('/') +
+            "/dataCollectionRules/$($env:DCR_IMMUTABLE_ID)/streams/$($env:DEPLOYMENT_STREAM)?api-version=2023-01-01"
+          $resp = Invoke-WebRequest -Method Post -Uri $uri -Headers @{ Authorization = ('Bearer ' + $token) } `
+            -ContentType 'application/json' -Body $body
+          "Logs Ingestion API returned HTTP $($resp.StatusCode) for run $($record.RunId) status $status"
