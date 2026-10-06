@@ -19,57 +19,63 @@ pool:
   vmImage: ubuntu-latest
 
 jobs:
-- job: deploy_staging
+- deployment: deploy_staging
   displayName: Build and deploy TrackSure (staging)
-  steps:
-  - task: UseDotNet@2
-    displayName: Use .NET 8 SDK
-    inputs:
-      packageType: sdk
-      version: 8.0.x
+  environment: tracksure-staging
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+        - checkout: self
 
-  - script: |
-      set -euo pipefail
-      dotnet publish RallTheoryGroup/src/products/tracksure/src/TrackSure.csproj -c Release -o "$(Build.ArtifactStagingDirectory)/publish"
-      cd "$(Build.ArtifactStagingDirectory)/publish"
-      zip -qr "$(Build.ArtifactStagingDirectory)/tracksure.zip" .
-    displayName: Publish and package TrackSure
+        - task: UseDotNet@2
+          displayName: Use .NET 8 SDK
+          inputs:
+            packageType: sdk
+            version: 8.0.x
 
-  - task: AzureCLI@2
-    displayName: Deploy TrackSure to App Service
-    inputs:
-      azureSubscription: ledgerflow-wif
-      scriptType: bash
-      scriptLocation: inlineScript
-      inlineScript: |
-        set -euo pipefail
-        az webapp deploy --name "${{ parameters.webAppName }}" --resource-group "$(resourceGroup)" \
-          --src-path "$(Build.ArtifactStagingDirectory)/tracksure.zip" --type zip --output none
-        curl --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 10 --max-time 20 \
-          "https://${{ parameters.webAppName }}.azurewebsites.net/health"
+        - script: |
+            set -euo pipefail
+            dotnet publish RallTheoryGroup/src/products/tracksure/src/TrackSure.csproj -c Release -o "$(Build.ArtifactStagingDirectory)/publish"
+            cd "$(Build.ArtifactStagingDirectory)/publish"
+            zip -qr "$(Build.ArtifactStagingDirectory)/tracksure.zip" .
+          displayName: Publish and package TrackSure
 
-  - task: AzureCLI@2
-    displayName: Record deployment outcome
-    condition: always()
-    inputs:
-      azureSubscription: ledgerflow-wif
-      scriptType: pscore
-      scriptLocation: inlineScript
-      inlineScript: |
-        $ErrorActionPreference = 'Stop'
-        $token = az account get-access-token --resource https://monitor.azure.com/ --query accessToken -o tsv
-        if ($LASTEXITCODE -ne 0 -or -not $token) { throw 'Cannot obtain ingestion token.' }
-        $record = @{
-          TimeGenerated = [DateTime]::UtcNow.ToString('o')
-          Application = 'TrackSure'
-          Environment = 'staging'
-          RunId = $env:BUILD_BUILDID
-          CommitId = $env:BUILD_SOURCEVERSION
-          Status = $env:AGENT_JOBSTATUS
-        }
-        $body = ConvertTo-Json -InputObject @($record) -Compress
-        $uri = "$(logsIngestionEndpoint)".TrimEnd('/') +
-          "/dataCollectionRules/$(dcrImmutableId)/streams/$(deploymentStream)?api-version=2023-01-01"
-        Invoke-RestMethod -Method Post -Uri $uri `
-          -Headers @{ Authorization = ('Bearer ' + $token) } `
-          -ContentType 'application/json' -Body $body
+        - task: AzureCLI@2
+          displayName: Deploy TrackSure to App Service
+          inputs:
+            azureSubscription: ledgerflow-wif
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              set -euo pipefail
+              az webapp deploy --name "${{ parameters.webAppName }}" --resource-group "$(resourceGroup)" \
+                --src-path "$(Build.ArtifactStagingDirectory)/tracksure.zip" --type zip --output none
+              curl --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 10 --max-time 20 \
+                "https://${{ parameters.webAppName }}.azurewebsites.net/health"
+
+        - task: AzureCLI@2
+          displayName: Record deployment outcome
+          condition: always()
+          inputs:
+            azureSubscription: ledgerflow-wif
+            scriptType: pscore
+            scriptLocation: inlineScript
+            inlineScript: |
+              $ErrorActionPreference = 'Stop'
+              $token = az account get-access-token --resource https://monitor.azure.com/ --query accessToken -o tsv
+              if ($LASTEXITCODE -ne 0 -or -not $token) { throw 'Cannot obtain ingestion token.' }
+              $record = @{
+                TimeGenerated = [DateTime]::UtcNow.ToString('o')
+                Application = 'TrackSure'
+                Environment = 'staging'
+                RunId = $env:BUILD_BUILDID
+                CommitId = $env:BUILD_SOURCEVERSION
+                Status = $env:AGENT_JOBSTATUS
+              }
+              $body = ConvertTo-Json -InputObject @($record) -Compress
+              $uri = "$(logsIngestionEndpoint)".TrimEnd('/') +
+                "/dataCollectionRules/$(dcrImmutableId)/streams/$(deploymentStream)?api-version=2023-01-01"
+              Invoke-RestMethod -Method Post -Uri $uri `
+                -Headers @{ Authorization = ('Bearer ' + $token) } `
+                -ContentType 'application/json' -Body $body
